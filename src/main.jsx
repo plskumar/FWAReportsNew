@@ -1,6 +1,6 @@
 import React, { useMemo, useState } from 'react';
 import { createRoot } from 'react-dom/client';
-import { AlertTriangle, BadgeDollarSign, BarChart3, CheckCircle2, Download, FileJson, FileText, Printer, Search, ShieldAlert, Upload, Users } from 'lucide-react';
+import { AlertTriangle, BadgeDollarSign, BarChart3, CheckCircle2, Download, FileJson, FileText, FolderOpen, Printer, RotateCcw, Search, ShieldAlert, Upload, Users } from 'lucide-react';
 import './styles.css';
 
 const nowIso = () => new Date().toISOString();
@@ -171,6 +171,72 @@ function normalizeInput(input) {
   };
 }
 
+function consolidateScenarioReport(reportKey, reports, fileCount) {
+  const fallback = seedReport.reports[reportKey];
+  if (!reports.length) return fallback;
+
+  const base = reports[0] || fallback;
+  const flaggedClaims = reports.flatMap(r => r.flagged_claims || []);
+  const totalExposure = reports.reduce((sum, r) => sum + Number(r.dollar_value || 0), 0);
+  const weightedScore = flaggedClaims.length
+    ? reports.reduce((sum, r) => sum + (Number(r.confidence_score || 0) * ((r.flagged_claims || []).length || 0)), 0) / flaggedClaims.length
+    : Number(base.confidence_score || 0);
+
+  let confidenceLevel = 'Not stated';
+  if (weightedScore >= 0.85) confidenceLevel = 'High';
+  else if (weightedScore >= 0.6) confidenceLevel = 'Medium';
+  else if (weightedScore > 0) confidenceLevel = 'Low';
+
+  const uniqueActions = [];
+  const seenActions = new Set();
+  reports.forEach(r => {
+    (r.recommended_actions || []).forEach(action => {
+      if (!seenActions.has(action)) {
+        seenActions.add(action);
+        uniqueActions.push(action);
+      }
+    });
+  });
+
+  return {
+    ...base,
+    finding_id: `F-CONSOLIDATED-${reportKey === 'duplicate_billing' ? 'DUP' : 'UP'}`,
+    subtitle: `Consolidated from ${fileCount} JSON file${fileCount === 1 ? '' : 's'} loaded from folder.`,
+    executive_summary: `This consolidated ${base.label.toLowerCase()} report combines findings from ${fileCount} source JSON file${fileCount === 1 ? '' : 's'}. It includes ${flaggedClaims.length} flagged claim line${flaggedClaims.length === 1 ? '' : 's'} with total exposure of ${money(totalExposure, base.currency)} pending validation and recovery workflow decisions.`,
+    confidence_level: confidenceLevel,
+    confidence_score: Number.isFinite(weightedScore) ? Number(weightedScore.toFixed(2)) : null,
+    dollar_value: Number(totalExposure.toFixed(2)),
+    flagged_claims: flaggedClaims,
+    recommended_actions: uniqueActions.length ? uniqueActions : base.recommended_actions
+  };
+}
+
+function buildConsolidatedPayload(parsedInputs, loadedFromFolderName) {
+  const normalized = parsedInputs.map(item => normalizeInput(item));
+  const duplicateReports = normalized.map(n => n.reports?.duplicate_billing).filter(Boolean);
+  const upcodingReports = normalized.map(n => n.reports?.upcoding).filter(Boolean);
+  const totalFindingCount = normalized.reduce((sum, n) => sum + Number(n.meta?.findingCount || 0), 0);
+  const fileCount = parsedInputs.length;
+  const generatedAt = nowIso();
+
+  return {
+    run_id: `folder-consolidated-${generatedAt}`,
+    status: 'completed',
+    schema_version: 'fwa-investigation-reports-2.0-consolidated',
+    generated_at: generatedAt,
+    model_trace: `consolidated from ${fileCount} JSON file${fileCount === 1 ? '' : 's'} in folder ${loadedFromFolderName}`,
+    reports: {
+      duplicate_billing: consolidateScenarioReport('duplicate_billing', duplicateReports, fileCount),
+      upcoding: consolidateScenarioReport('upcoding', upcodingReports, fileCount)
+    },
+    consolidated_meta: {
+      source_files: fileCount,
+      source_folder: loadedFromFolderName,
+      total_findings_seen: totalFindingCount
+    }
+  };
+}
+
 function buildFooter(report, meta, activeKey) {
   const finding = report.source_finding || report;
   return [
@@ -182,12 +248,14 @@ function buildFooter(report, meta, activeKey) {
   ];
 }
 
-function TopBar({ onLoad, loadedName }) {
+function TopBar({ onLoad, onLoadFolder, onReset, loadedName }) {
   return (
     <header className="topbar">
       <div className="brand"><ShieldAlert /><div><strong>FWAReports</strong><span>Investigator portal for duplicate billing and upcoding recovery reports</span></div></div>
       <div className="topActions">
         <label className="upload"><Upload size={17}/> Upload JSON<input type="file" accept="application/json" onChange={onLoad}/></label>
+        <label className="upload"><FolderOpen size={17}/> Load from Folder<input type="file" accept="application/json" multiple webkitdirectory="" directory="" onChange={onLoadFolder}/></label>
+        <button className="secondary" onClick={onReset}><RotateCcw size={17}/> Reset to default JSON</button>
         {loadedName && <span className="loaded">Loaded: {loadedName}</span>}
       </div>
     </header>
@@ -223,6 +291,21 @@ function ConfidenceBanner({ report }) {
 
 function TabButton({ id, active, onClick, children }) {
   return <button className={active ? 'tab active' : 'tab'} onClick={() => onClick(id)}>{children}</button>;
+}
+
+function FolderSummaryBadge({ summary }) {
+  if (!summary) return null;
+  return (
+    <div className="folderSummaryWrap">
+      <div className="folderSummary">
+        <strong>Folder run</strong>
+        <span>{summary.folderName}</span>
+        <span>{summary.loadedCount} loaded</span>
+        <span>{summary.failedCount} failed</span>
+        <span>{summary.totalFiles} total</span>
+      </div>
+    </div>
+  );
 }
 
 function ClaimsTable({ claims, currencyCode, search }) {
@@ -308,6 +391,7 @@ function App() {
   const [active, setActive] = useState('duplicate_billing');
   const [rawData, setRawData] = useState(seedReport);
   const [loadedName, setLoadedName] = useState('demo seed data');
+  const [folderSummary, setFolderSummary] = useState(null);
   const normalized = useMemo(() => normalizeInput(rawData), [rawData]);
   const report = normalized.reports[active] || normalized.reports.duplicate_billing;
 
@@ -318,18 +402,64 @@ function App() {
       const parsed = JSON.parse(await file.text());
       setRawData(parsed);
       setLoadedName(file.name);
+      setFolderSummary(null);
     } catch (error) {
       alert(`Could not parse JSON: ${error.message}`);
     }
   };
 
+  const onReset = () => {
+    setRawData(seedReport);
+    setLoadedName('demo seed data');
+    setFolderSummary(null);
+  };
+
+  const onLoadFolder = async event => {
+    const files = Array.from(event.target.files || []).filter(file => file.name.toLowerCase().endsWith('.json'));
+    if (!files.length) {
+      alert('No JSON files were found in the selected folder.');
+      return;
+    }
+
+    const parsed = [];
+    const failures = [];
+    for (const file of files) {
+      try {
+        parsed.push(JSON.parse(await file.text()));
+      } catch (error) {
+        failures.push(`${file.name}: ${error.message}`);
+      }
+    }
+
+    if (!parsed.length) {
+      alert(`Could not parse any JSON files from the selected folder.\n\n${failures.join('\n')}`);
+      return;
+    }
+
+    const folderName = files[0].webkitRelativePath?.split('/')[0] || 'selected folder';
+    const consolidated = buildConsolidatedPayload(parsed, folderName);
+    setRawData(consolidated);
+    setLoadedName(`Folder: ${folderName} (${parsed.length} JSON file${parsed.length === 1 ? '' : 's'})`);
+    setFolderSummary({
+      folderName,
+      totalFiles: files.length,
+      loadedCount: parsed.length,
+      failedCount: failures.length
+    });
+
+    if (failures.length) {
+      alert(`Loaded ${parsed.length} JSON file${parsed.length === 1 ? '' : 's'} with ${failures.length} parse failure${failures.length === 1 ? '' : 's'}.\n\n${failures.join('\n')}`);
+    }
+  };
+
   return (
     <div className="app">
-      <TopBar onLoad={onLoad} loadedName={loadedName} />
+      <TopBar onLoad={onLoad} onLoadFolder={onLoadFolder} onReset={onReset} loadedName={loadedName} />
       <nav className="tabs">
         <TabButton id="duplicate_billing" active={active === 'duplicate_billing'} onClick={setActive}>Duplicate Billing</TabButton>
         <TabButton id="upcoding" active={active === 'upcoding'} onClick={setActive}>Upcoding</TabButton>
       </nav>
+      <FolderSummaryBadge summary={folderSummary} />
       <ReportTab report={report} meta={{ ...normalized.meta }} activeKey={active} />
       <div className="status"><CheckCircle2 size={16}/> GitHub Actions deployment ready</div>
     </div>
