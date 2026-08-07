@@ -117,12 +117,7 @@ function escapeHtml(value) {
 }
 
 function openPopupWindow(title, bodyHtml) {
-  const win = window.open('', '_blank', 'noopener,noreferrer,width=1200,height=800');
-  if (!win) {
-    alert('Popup blocked. Please allow popups for this site and try again.');
-    return;
-  }
-  win.document.write(`<!doctype html>
+  const popupHtml = `<!doctype html>
 <html lang="en">
   <head>
     <meta charset="UTF-8" />
@@ -139,8 +134,18 @@ function openPopupWindow(title, bodyHtml) {
     </style>
   </head>
   <body>${bodyHtml}</body>
-</html>`);
-  win.document.close();
+</html>`;
+
+  const blob = new Blob([popupHtml], { type: 'text/html' });
+  const popupUrl = URL.createObjectURL(blob);
+  const win = window.open(popupUrl, '_blank', 'width=1200,height=800');
+  if (!win) {
+    URL.revokeObjectURL(popupUrl);
+    alert('Popup blocked. Please allow popups for this site and try again.');
+    return;
+  }
+  win.focus();
+  setTimeout(() => URL.revokeObjectURL(popupUrl), 60000);
 }
 
 function normalizeBasysFinding(finding) {
