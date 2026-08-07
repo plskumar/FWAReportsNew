@@ -74,6 +74,22 @@ th { text-align: left; background: #f8fafc; color: #475569; font-size: 13px; pad
 td { padding: 14px; border-bottom: 1px solid #eef2f7; vertical-align: top; }
 tr:last-child td { border-bottom: 0; }
 .muted { display: block; color: #64748b; font-size: 12px; margin-top: 4px; }
+.claimInline { color: #64748b; font-size: 12px; margin-left: 6px; white-space: nowrap; }
+.more {
+  display: block;
+  width: 100%;
+  text-align: left;
+  padding: 10px 14px;
+  color: #1d4ed8;
+  font-size: 13px;
+  border: 0;
+  border-top: 1px solid #eef2f7;
+  background: #f8fafc;
+  cursor: pointer;
+  font-weight: 700;
+}
+.more:hover { background: #edf4ff; }
+.morePanel { border: 1px solid #dbe8fb; border-radius: 12px; margin-top: 12px; }
 .empty { padding: 18px; color: #64748b; }
 .observations { display: grid; gap: 12px; }
 .observations p { margin: 0; background: #f8fafc; border-left: 4px solid #2563eb; border-radius: 12px; padding: 14px; }

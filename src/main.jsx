@@ -107,6 +107,42 @@ function toCsv(report) {
   return rows.map(r => r.map(v => `"${String(v ?? '').replaceAll('"', '""')}"`).join(',')).join('\n');
 }
 
+function escapeHtml(value) {
+  return String(value ?? '')
+    .replaceAll('&', '&amp;')
+    .replaceAll('<', '&lt;')
+    .replaceAll('>', '&gt;')
+    .replaceAll('"', '&quot;')
+    .replaceAll("'", '&#39;');
+}
+
+function openPopupWindow(title, bodyHtml) {
+  const win = window.open('', '_blank', 'noopener,noreferrer,width=1200,height=800');
+  if (!win) {
+    alert('Popup blocked. Please allow popups for this site and try again.');
+    return;
+  }
+  win.document.write(`<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>${escapeHtml(title)}</title>
+    <style>
+      body { font-family: "Segoe UI", Arial, sans-serif; margin: 18px; color: #172033; }
+      h1 { margin-top: 0; font-size: 24px; }
+      .sub { color: #475569; margin-bottom: 14px; }
+      table { width: 100%; border-collapse: collapse; min-width: 860px; }
+      th { text-align: left; background: #f8fafc; color: #475569; font-size: 13px; padding: 10px 12px; border-bottom: 1px solid #dfe8f5; }
+      td { padding: 12px; border-bottom: 1px solid #eaf0f8; vertical-align: top; font-size: 14px; }
+      .obs p { margin: 0 0 10px; padding: 10px 12px; border-left: 4px solid #2563eb; background: #f8fafc; border-radius: 8px; line-height: 1.45; }
+    </style>
+  </head>
+  <body>${bodyHtml}</body>
+</html>`);
+  win.document.close();
+}
+
 function normalizeBasysFinding(finding) {
   const lines = (finding.sampled_claim_lines || []).filter(l => String(l.diagnosis_support).toLowerCase() === 'inconsistent');
   const flagged = lines.map(line => ({
@@ -308,16 +344,21 @@ function FolderSummaryBadge({ summary }) {
   );
 }
 
-function ClaimsTable({ claims, currencyCode, search }) {
+function ClaimsTable({ claims, currencyCode, search, onOpenAllClaims }) {
   const filtered = (claims || []).filter(c => JSON.stringify(c).toLowerCase().includes(search.toLowerCase()));
+  const visibleClaims = filtered.slice(0, 20);
+  const extraClaimsCount = filtered.length - visibleClaims.length;
   return (
     <div className="tableWrap">
       <table>
         <thead><tr><th>Claim ID</th><th>Claim Date</th><th>Service Provider</th><th>Amount Paid</th></tr></thead>
         <tbody>
-          {filtered.map((claim, i) => (
+          {visibleClaims.map((claim, i) => (
             <tr key={`${claim.claim_id}-${claim.line}-${i}`}>
-              <td><strong>{claim.claim_id}</strong><span className="muted">Line {claim.line || 'N/A'} {claim.procedure ? `| ${claim.procedure}` : ''}</span></td>
+              <td>
+                <strong>{claim.claim_id}</strong>
+                <span className="claimInline"> Line {claim.line || 'N/A'} {claim.procedure ? `| ${claim.procedure}` : ''}</span>
+              </td>
               <td>{claim.claim_date || 'Not provided'}</td>
               <td>{claim.service_provider || 'Not provided'}</td>
               <td>{money(claim.amount_paid, currencyCode)}</td>
@@ -326,6 +367,7 @@ function ClaimsTable({ claims, currencyCode, search }) {
         </tbody>
       </table>
       {!filtered.length && <div className="empty">No claims match the current search.</div>}
+      {extraClaimsCount > 0 && <button type="button" className="more" onClick={() => onOpenAllClaims(filtered)}>More... ({extraClaimsCount} additional claims)</button>}
     </div>
   );
 }
@@ -335,8 +377,36 @@ function ReportTab({ report, meta, activeKey }) {
   const footnotes = useMemo(() => buildFooter(report, meta, activeKey), [report, meta, activeKey]);
   const safeId = String(report.finding_id || activeKey).toLowerCase().replace(/[^a-z0-9]+/g, '-');
   const filtered = (report.flagged_claims || []).filter(c => JSON.stringify(c).toLowerCase().includes(search.toLowerCase()));
+  const visibleObservations = filtered.slice(0, 20);
+  const extraObservationsCount = filtered.length - visibleObservations.length;
   const exportJson = () => exportFile(`${safeId}.json`, JSON.stringify({ run_id: meta.runId, report_generated_at: nowIso(), report }, null, 2), 'application/json');
   const exportCsv = () => exportFile(`${safeId}-flagged-claims.csv`, toCsv(report), 'text/csv');
+  const openAllClaimsWindow = claimsList => {
+    const rows = claimsList.map(claim => `
+      <tr>
+        <td><strong>${escapeHtml(claim.claim_id || 'Not provided')}</strong> | Line ${escapeHtml(claim.line || 'N/A')} ${claim.procedure ? `| ${escapeHtml(claim.procedure)}` : ''}</td>
+        <td>${escapeHtml(claim.claim_date || 'Not provided')}</td>
+        <td>${escapeHtml(claim.service_provider || 'Not provided')}</td>
+        <td>${escapeHtml(money(claim.amount_paid, report.currency))}</td>
+      </tr>
+    `).join('');
+    openPopupWindow(`${report.label} - All Claims`, `
+      <h1>${escapeHtml(report.label)} - All Flagged Claims</h1>
+      <div class="sub">Showing ${claimsList.length} matching claims.</div>
+      <table>
+        <thead><tr><th>Claim ID</th><th>Claim Date</th><th>Service Provider</th><th>Amount Paid</th></tr></thead>
+        <tbody>${rows}</tbody>
+      </table>
+    `);
+  };
+  const openAllObservationsWindow = claimsList => {
+    const items = claimsList.map(claim => `<p>${escapeHtml(claim.observation || `Claim ${claim.claim_id} line ${claim.line}: Observation not provided in source JSON.`)}</p>`).join('');
+    openPopupWindow(`${report.label} - All Observations`, `
+      <h1>${escapeHtml(report.label)} - Per-Claim Line Observations</h1>
+      <div class="sub">Showing ${claimsList.length} matching observations.</div>
+      <div class="obs">${items}</div>
+    `);
+  };
 
   return (
     <main className="report">
@@ -367,14 +437,15 @@ function ReportTab({ report, meta, activeKey }) {
           <h2>Flagged claims</h2>
           <label className="search"><Search size={16}/><input value={search} onChange={e => setSearch(e.target.value)} placeholder="Search claim, provider, procedure..." /></label>
         </div>
-        <ClaimsTable claims={report.flagged_claims || []} currencyCode={report.currency} search={search} />
+        <ClaimsTable claims={report.flagged_claims || []} currencyCode={report.currency} search={search} onOpenAllClaims={openAllClaimsWindow} />
       </section>
 
       <section className="panel">
         <h2>Per-claim line observations</h2>
         <div className="observations">
-          {filtered.map((claim, i) => <p key={`${claim.claim_id}-${claim.line}-obs-${i}`}>{claim.observation || `Claim ${claim.claim_id} line ${claim.line}: Observation not provided in source JSON.`}</p>)}
+          {visibleObservations.map((claim, i) => <p key={`${claim.claim_id}-${claim.line}-obs-${i}`}>{claim.observation || `Claim ${claim.claim_id} line ${claim.line}: Observation not provided in source JSON.`}</p>)}
         </div>
+        {extraObservationsCount > 0 && <button type="button" className="more morePanel" onClick={() => openAllObservationsWindow(filtered)}>More... ({extraObservationsCount} additional observations)</button>}
       </section>
 
       <section className="panel actions">
