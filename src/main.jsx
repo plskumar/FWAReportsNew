@@ -1,9 +1,35 @@
 import React, { useMemo, useState } from 'react';
 import { createRoot } from 'react-dom/client';
-import { AlertTriangle, BadgeDollarSign, BarChart3, CheckCircle2, Download, FileJson, FileText, FolderOpen, Printer, RotateCcw, Search, ShieldAlert, Upload, Users } from 'lucide-react';
+import { AlertTriangle, BadgeDollarSign, BarChart3, CheckCircle2, Download, FileJson, FileText, FolderOpen, LoaderCircle, Printer, RotateCcw, Search, ShieldAlert, Upload, Users } from 'lucide-react';
+import * as XLSX from 'xlsx';
 import './styles.css';
 
 const nowIso = () => new Date().toISOString();
+const appVersion = import.meta.env.VITE_BUILD_VERSION || '1.0.0.1 | development';
+const lastFolderStorageKey = 'fwa-reports-last-folder';
+
+function getStoredLastFolderRun() {
+  try {
+    const saved = localStorage.getItem(lastFolderStorageKey);
+    return saved ? JSON.parse(saved) : null;
+  } catch {
+    return null;
+  }
+}
+
+const emptyReport = (label, message) => ({
+  label,
+  finding_id: 'No imported data',
+  scenario: label.toLowerCase().replaceAll(' ', '_'),
+  confidence_level: 'Not stated',
+  confidence_score: null,
+  subtitle: message,
+  executive_summary: message,
+  dollar_value: 0,
+  currency: 'USD',
+  flagged_claims: [],
+  recommended_actions: []
+});
 
 const seedReport = {
   run_id: 'demo-001',
@@ -65,6 +91,22 @@ function money(value, code = 'USD') {
   return new Intl.NumberFormat('en-US', { style: 'currency', currency: code }).format(Number(value || 0));
 }
 
+function numericValue(value) {
+  if (typeof value === 'number') return Number.isFinite(value) ? value : 0;
+  const text = String(value ?? '').trim();
+  if (!text) return 0;
+  const negative = text.startsWith('(') && text.endsWith(')');
+  const match = text.replace(/,/g, '').match(/-?\d+(?:\.\d+)?/);
+  if (!match) return 0;
+  const result = Number(match[0]);
+  return (negative ? -1 : 1) * (Number.isFinite(result) ? result : 0);
+}
+
+function displayValue(value) {
+  if (value instanceof Date) return value.toISOString().slice(0, 10);
+  return value;
+}
+
 function dateTime(value) {
   const d = value ? new Date(value) : new Date();
   if (Number.isNaN(d.getTime())) return String(value || 'Not available');
@@ -75,6 +117,21 @@ function pct(value) {
   const n = Number(value);
   if (!Number.isFinite(n)) return 'N/A';
   return `${Math.round(n * 100)}%`;
+}
+
+function confidenceScoreText(value) {
+  const n = Number(value);
+  if (!Number.isFinite(n)) return String(value ?? 'N/A');
+  return n <= 1 ? pct(n) : String(n);
+}
+
+function confidenceBandForScore(value) {
+  const score = Number(value);
+  if (!Number.isFinite(score)) return 'Not stated';
+  const normalized = score > 1 ? score / 100 : score;
+  if (normalized >= 0.85) return 'High';
+  if (normalized >= 0.6) return 'Medium';
+  return 'Low';
 }
 
 function confidence(report) {
@@ -149,17 +206,19 @@ function openPopupWindow(title, bodyHtml) {
 }
 
 function normalizeBasysFinding(finding) {
-  const lines = (finding.sampled_claim_lines || []).filter(l => String(l.diagnosis_support).toLowerCase() === 'inconsistent');
+  const lines = finding.sampled_claim_lines || [];
   const flagged = lines.map(line => ({
     claim_id: line.CLAIM_NBR,
     line: line.CLAIM_LINE_NBR,
     claim_date: line.CLAIM_DATE || line.SERVICE_DATE || 'Not provided',
-    service_provider: finding.servicing_provider_id,
+    service_provider: line.SVC_PROVIDER_ID || line.SERVICING_PROVIDER_ID || line.PROVIDER_ID || line.PROVIDER || finding.servicing_provider_id,
     amount_paid: Number(line.DER_ACTUAL_PAYMENT_COMP_AMT || 0),
     procedure: line.PRIMARY_SERVICE_CODE,
     diagnosis_support: line.diagnosis_support,
-    observation: `Claim ${line.CLAIM_NBR} line ${line.CLAIM_LINE_NBR}: This line was billed by provider ${finding.servicing_provider_id} and paid ${Number(line.DER_ACTUAL_PAYMENT_COMP_AMT || 0).toFixed(2)} ${finding.exposure?.currency || 'USD'} for procedure ${line.PRIMARY_SERVICE_CODE}. The coded-claim review marked diagnosis support as inconsistent with the billed level. Clinical documentation should be reviewed before confirming recovery because this automated review evaluates coded-data plausibility, not the medical record.`
+    observation: line.OBSERVATION || line.REASONING || buildClaimObservation(line, finding)
   }));
+  const lineTotal = flagged.reduce((sum, line) => sum + numericValue(line.amount_paid), 0);
+  const reportedTotal = numericValue(finding.exposure?.flagged_paid_amt);
   return {
     label: 'Upcoding',
     finding_id: finding.finding_id,
@@ -169,9 +228,10 @@ function normalizeBasysFinding(finding) {
     provider_npi: finding.provider_npi,
     confidence_level: finding.score?.band || 'Not stated',
     confidence_score: finding.score?.value,
+    confidence_levels: finding.confidence_levels,
     subtitle: 'Provider-pattern E&M upcoding signal converted from BASYS/FWA finding schema.',
     executive_summary: finding.reasoning_chain?.judge || finding.reasoning_chain?.critique || seedReport.reports.upcoding.executive_summary,
-    dollar_value: Number(finding.exposure?.flagged_paid_amt || 0),
+    dollar_value: reportedTotal || lineTotal,
     currency: finding.exposure?.currency || 'USD',
     flagged_claims: flagged.length ? flagged : seedReport.reports.upcoding.flagged_claims,
     recommended_actions: seedReport.reports.upcoding.recommended_actions,
@@ -179,7 +239,38 @@ function normalizeBasysFinding(finding) {
   };
 }
 
+function buildClaimObservation(line, finding) {
+  const provider = line.SVC_PROVIDER_ID || line.SERVICING_PROVIDER_ID || line.PROVIDER_ID || line.PROVIDER || finding.servicing_provider_id || 'Not provided';
+  const amount = Number(line.DER_ACTUAL_PAYMENT_COMP_AMT || 0).toFixed(2);
+  const currency = finding.exposure?.currency || 'USD';
+  const prefix = `Claim ${line.CLAIM_NBR} line ${line.CLAIM_LINE_NBR}: Provider ${provider} paid ${amount} ${currency} for procedure ${line.PRIMARY_SERVICE_CODE || 'not provided'}.`;
+  const reasoning = finding.scenario === 'duplicate_billing'
+    ? finding.reasoning_chain_finder || finding.reasoning_chain_judge
+    : finding.reasoning_finder || finding.reasoning_critique || finding.reasoning_judge;
+  return reasoning ? `${prefix} ${reasoning}` : prefix;
+}
+
+function findingScenario(finding) {
+  const declaredScenario = String(finding?.scenario || finding?.finding_type || '').toLowerCase();
+  if (declaredScenario.includes('duplicate')) return 'duplicate_billing';
+  if (declaredScenario.includes('upcod')) return 'em_upcoding';
+  const text = JSON.stringify(finding).toLowerCase();
+  return text.includes('duplicate') || text.includes('comparator_claim') || text.includes('original_claim')
+    ? 'duplicate_billing'
+    : 'em_upcoding';
+}
+
 function normalizeInput(input) {
+  if (!input) {
+    return {
+      reports: {
+        duplicate_billing: emptyReport('Duplicate Billing', 'Select a JSON or Excel file to load a report.'),
+        upcoding: emptyReport('Upcoding', 'Select a JSON or Excel file to load a report.')
+      },
+      meta: {}
+    };
+  }
+
   if (input?.reports?.duplicate_billing && input?.reports?.upcoding) {
     return {
       reports: input.reports,
@@ -194,12 +285,18 @@ function normalizeInput(input) {
   }
 
   const findings = Array.isArray(input?.findings) ? input.findings : [];
-  const upcodingFindings = findings.filter(f => String(f.scenario || '').toLowerCase().includes('upcoding'));
-  const primary = upcodingFindings[0] || findings[0];
+  const primary = findings[0];
+  const isDuplicate = primary && findingScenario(primary) === 'duplicate_billing';
+  const normalizedPrimary = primary ? normalizeBasysFinding(primary) : null;
+  if (isDuplicate && normalizedPrimary) {
+    normalizedPrimary.label = 'Duplicate Billing';
+    normalizedPrimary.scenario = 'duplicate_billing';
+    normalizedPrimary.subtitle = 'Duplicate billing signal converted from the imported file schema.';
+  }
   return {
     reports: {
-      duplicate_billing: seedReport.reports.duplicate_billing,
-      upcoding: primary ? normalizeBasysFinding(primary) : seedReport.reports.upcoding
+      duplicate_billing: isDuplicate && normalizedPrimary ? normalizedPrimary : emptyReport('Duplicate Billing', 'The imported file does not contain duplicate billing findings.'),
+      upcoding: !isDuplicate && normalizedPrimary ? normalizedPrimary : emptyReport('Upcoding', 'No upcoding findings were found in the imported file.')
     },
     meta: {
       runId: input?.run_id || seedReport.run_id,
@@ -278,6 +375,165 @@ function buildConsolidatedPayload(parsedInputs, loadedFromFolderName) {
   };
 }
 
+function reportKeyForInput(input) {
+  const scenario = String(input?.reports?.upcoding?.scenario || input?.findings?.[0]?.scenario || '').toLowerCase();
+  return scenario.includes('duplicate') ? 'duplicate_billing' : 'upcoding';
+}
+
+function reportKeyForFile(file, fallback = 'upcoding') {
+  if (/duplicate|dup_billing|duplicate_billing/i.test(file.name)) return 'duplicate_billing';
+  if (/upcod|em_upcoding/i.test(file.name)) return 'upcoding';
+  return fallback;
+}
+
+function clearReportCategory(rawData, reportKey) {
+  const current = normalizeInput(rawData);
+  return {
+    reports: {
+      ...current.reports,
+      [reportKey]: emptyReport(
+        reportKey === 'duplicate_billing' ? 'Duplicate Billing' : 'Upcoding',
+        'Loading the selected file...'
+      )
+    },
+    meta: current.meta
+  };
+}
+
+function mergeImportedCategory(currentData, importedData) {
+  const current = normalizeInput(currentData);
+  const imported = normalizeInput(importedData);
+  const reportKey = reportKeyForInput(importedData);
+  return {
+    reports: {
+      ...current.reports,
+      [reportKey]: imported.reports[reportKey]
+    },
+    meta: imported.meta
+  };
+}
+
+async function parseInputFile(file, fallbackScenario = 'upcoding') {
+  const extension = file.name.split('.').pop()?.toLowerCase();
+  if (extension === 'json') return JSON.parse(await file.text());
+  if (!['xls', 'xlsm', 'xlsx'].includes(extension)) {
+    throw new Error('Supported input files are JSON, XLS, XLSM, and XLSX.');
+  }
+
+  const workbook = XLSX.read(await file.arrayBuffer(), { type: 'array', cellDates: true });
+  const headerTerms = ['claim', 'provider', 'procedure', 'service', 'paid', 'amount', 'payment', 'npi'];
+  const rows = workbook.SheetNames.flatMap(sheetName => {
+    const sheet = workbook.Sheets[sheetName];
+    const matrix = XLSX.utils.sheet_to_json(sheet, { header: 1, defval: null });
+    const headerIndex = matrix.slice(0, 20).findIndex(row => {
+      const text = row.map(value => String(value ?? '').toLowerCase()).join(' ');
+      return headerTerms.filter(term => text.includes(term)).length >= 2;
+    });
+    return XLSX.utils.sheet_to_json(sheet, { defval: null, range: headerIndex >= 0 ? headerIndex : 0 });
+  });
+  if (!rows.length) throw new Error('The workbook does not contain any tabular rows.');
+
+  const firstRowValues = Object.values(rows[0]);
+  if (rows.length === 1 && firstRowValues.length === 1 && typeof firstRowValues[0] === 'string') {
+    try {
+      return JSON.parse(firstRowValues[0]);
+    } catch {
+      // Treat a regular one-cell worksheet as tabular input below.
+    }
+  }
+
+  const normalizeKey = key => String(key).trim().toUpperCase().replace(/[^A-Z0-9]+/g, '_');
+  const normalizedRows = rows.map(row => Object.fromEntries(Object.entries(row).map(([key, value]) => [normalizeKey(key), value])));
+  const explicitScenario = normalizedRows.map(row => row.SCENARIO || row.FINDING_TYPE).find(Boolean);
+  const explicitScenarioText = String(explicitScenario || '').toLowerCase();
+  const scenario = explicitScenarioText.includes('duplicate')
+    ? 'duplicate_billing'
+    : explicitScenarioText.includes('upcod')
+      ? 'em_upcoding'
+      : reportKeyForFile(file, fallbackScenario) === 'duplicate_billing'
+        ? 'duplicate_billing'
+        : 'em_upcoding';
+  const claimLines = rows.map((row, rowIndex) => {
+    const normalized = Object.fromEntries(Object.entries(row).map(([key, value]) => [normalizeKey(key), value]));
+    const compact = key => normalizeKey(key).replaceAll('_', '');
+    const compactValues = Object.fromEntries(Object.entries(normalized).map(([key, value]) => [compact(key), value]));
+    const valueFor = (...keys) => keys
+      .flatMap(key => [normalized[normalizeKey(key)], compactValues[compact(key)]])
+      .find(value => value !== undefined && value !== null && value !== '');
+    const amount = valueFor(
+      'DER_ACTUAL_PAYMENT_COMP_AMT',
+      'AMOUNT_PAID',
+      'PAID_AMOUNT',
+      'PAYMENT_AMOUNT',
+      'PAYMENT',
+      'PAID',
+      'TOTAL_PAID',
+      'PAID_AMT',
+      'AMT_PAID',
+      'ACTUAL_PAYMENT',
+      'PAYMENT_COMP_AMT',
+      'EXPOSURE_FLAGGED_PAID_AMT',
+      'EXPOSURE_FLAGGED_PAID_AMOUNT',
+      'FLAGGED_PAID_AMT',
+      'TOTAL_PAID_AMOUNT',
+      'ACTUAL_PAID_AMOUNT',
+      'REIMBURSEMENT_AMOUNT',
+      'OVERPAYMENT_AMOUNT',
+      'RECOVERABLE_AMOUNT',
+      'EXPOSURE_AMOUNT',
+      'DOLLAR_VALUE',
+      'AMOUNT'
+    ) ?? Object.entries(normalized).find(([key, value]) => {
+      const headerLooksLikeAmount = /(PAID|PAYMENT|REIMBURSEMENT|COMP|OVERPAYMENT|RECOVERABLE|EXPOSURE|AMOUNT|VALUE|DOLLAR)/.test(key)
+        && /(AMOUNT|AMT|VALUE|DOLLAR|COST|PAYMENT|PAID|EXPOSURE|OVERPAYMENT|RECOVERABLE)/.test(key);
+      return headerLooksLikeAmount && numericValue(value) !== 0;
+    })?.[1];
+    return {
+      ...normalized,
+      CLAIM_NBR: valueFor('CLAIM_NBR', 'CLAIM_ID', 'CLAIM_NUMBER', 'CLAIM', 'CLAIM_NO') || `Excel row ${rowIndex + 2}`,
+      CLAIM_LINE_NBR: valueFor('CLAIM_LINE_NBR', 'LINE', 'LINE_NUMBER', 'CLAIM_LINE') || '1',
+      CLAIM_DATE: displayValue(valueFor('CLAIM_DATE', 'SERVICE_DATE', 'DATE_OF_SERVICE', 'DOS', 'DATE', 'SERVICE_IDENTITY_FIRST_SERVICE_DATE')),
+      PRIMARY_SERVICE_CODE: valueFor('PRIMARY_SERVICE_CODE', 'SERVICE_IDENTITY_PRIMARY_SERVICE_CODE', 'PROCEDURE', 'PROCEDURE_CODE', 'SERVICE_CODE', 'CPT_CODE', 'CPT'),
+      SVC_PROVIDER_ID: valueFor('SVC_PROVIDER_ID', 'SERVICING_PROVIDER_ID', 'PROVIDER_ID', 'PROVIDER', 'PROVIDER_NPI', 'NPI'),
+      DER_ACTUAL_PAYMENT_COMP_AMT: numericValue(amount),
+      diagnosis_support: valueFor('DIAGNOSIS_SUPPORT', 'DIAGNOSIS_REVIEW', 'SUPPORT', 'REVIEW_RESULT') || 'inconsistent'
+    };
+  });
+  const first = claimLines[0];
+  const totalPaid = claimLines.reduce((sum, line) => sum + Number(line.DER_ACTUAL_PAYMENT_COMP_AMT || 0), 0);
+  const reportExposure = totalPaid;
+  const numericScores = normalizedRows
+    .map(row => row.SCORE_VALUE ?? row.CONFIDENCE_SCORE)
+    .map(Number)
+    .filter(Number.isFinite);
+  const averageScore = numericScores.length
+    ? numericScores.reduce((sum, score) => sum + (score > 1 ? score / 100 : score), 0) / numericScores.length
+    : null;
+  const confidenceLevels = Array.from(new Map(normalizedRows
+    .map(row => ({ level: row.SCORE_BAND || row.CONFIDENCE_LEVEL, score: row.SCORE_VALUE || row.CONFIDENCE_SCORE }))
+    .filter(item => item.level || item.score !== undefined)
+    .map(item => [`${item.level || 'Not stated'}:${item.score ?? ''}`, item])).values());
+  return {
+    findings: [{
+      finding_id: first.FINDING_ID || `excel-${file.name}`,
+      scenario,
+      finding_type: first.FINDING_TYPE || 'excel_tabular_input',
+      servicing_provider_id: first.SERVICING_PROVIDER_ID || first.SVC_PROVIDER_ID || first.PROVIDER_ID || first.PROVIDER || first.PROVIDER_NPI,
+      provider_npi: first.PROVIDER_NPI || first.NPI,
+      score: { band: averageScore === null ? first.CONFIDENCE_LEVEL || first.SCORE_BAND || 'Not stated' : confidenceBandForScore(averageScore), value: averageScore === null ? first.CONFIDENCE_SCORE || first.SCORE_VALUE : averageScore },
+      confidence_levels: confidenceLevels,
+      confidence_scores: numericScores,
+      reasoning_chain_finder: first.REASONING_CHAIN_FINDER,
+      reasoning_chain_judge: first.REASONING_CHAIN_JUDGE,
+      reasoning_finder: first.REASONING_FINDER,
+      reasoning_critique: first.REASONING_CRITIQUE,
+      reasoning_judge: first.REASONING_JUDGE,
+      exposure: { flagged_paid_amt: reportExposure, currency: first.CURRENCY || 'USD' },
+      sampled_claim_lines: claimLines
+    }]
+  };
+}
+
 function buildFooter(report, meta, activeKey) {
   const finding = report.source_finding || report;
   return [
@@ -289,13 +545,14 @@ function buildFooter(report, meta, activeKey) {
   ];
 }
 
-function TopBar({ onLoad, onLoadFolder, onReset, loadedName }) {
+function TopBar({ onLoad, onLoadFolder, onUseLastFolder, onReset, loadedName, hasLastFolder }) {
   return (
     <header className="topbar">
-      <div className="brand"><ShieldAlert /><div><strong>FWAReports</strong><span>Investigator portal for duplicate billing and upcoding recovery reports</span></div></div>
+      <div className="brand"><ShieldAlert /><div><strong>FWAReports <small>{appVersion}</small></strong><span>Investigator portal for duplicate billing and upcoding recovery reports</span></div></div>
       <div className="topActions">
-        <label className="upload"><Upload size={17}/> Upload JSON<input type="file" accept="application/json" onChange={onLoad}/></label>
-        <label className="upload"><FolderOpen size={17}/> Load from Folder<input type="file" accept="application/json" multiple webkitdirectory="" directory="" onChange={onLoadFolder}/></label>
+        <label className="upload"><Upload size={17}/> Upload JSON or Excel<input type="file" accept=".json,.xls,.xlsm,.xlsx,application/json,application/vnd.ms-excel,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" onChange={onLoad}/></label>
+        <label className="upload"><FolderOpen size={17}/> Load from Folder<input type="file" accept=".json,.xls,.xlsm,.xlsx,application/json,application/vnd.ms-excel,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" multiple webkitdirectory="" directory="" onChange={onLoadFolder}/></label>
+        {hasLastFolder && <button className="secondary" onClick={onUseLastFolder}><FolderOpen size={17}/> Use Last Uploaded Folder</button>}
         <button className="secondary" onClick={onReset}><RotateCcw size={17}/> Reset to default JSON</button>
         {loadedName && <span className="loaded">Loaded: {loadedName}</span>}
       </div>
@@ -320,12 +577,24 @@ function KpiCards({ report }) {
 function ConfidenceBanner({ report }) {
   const c = confidence(report);
   const scoreText = typeof c.score === 'number' ? (c.score <= 1 ? pct(c.score) : String(c.score)) : c.score;
+  const scores = (report.confidence_scores || []).map(Number).filter(Number.isFinite);
+  const normalizedScores = scores.map(score => score > 1 ? score / 100 : score);
+  const averageScore = normalizedScores.length ? normalizedScores.reduce((sum, score) => sum + score, 0) / normalizedScores.length : null;
+  const distribution = ['High', 'Medium', 'Low'].map(level => {
+    const count = normalizedScores.filter(score => confidenceBandForScore(score) === level).length;
+    return { level, count, percent: normalizedScores.length ? Math.round((count / normalizedScores.length) * 100) : 0 };
+  });
   return (
     <section className={`confidenceBanner ${confidenceClass(c.level)}`}>
       <AlertTriangle size={18} />
       <span>Confidence level</span>
       <strong>{c.level}</strong>
       {scoreText && <em>Score: {scoreText}</em>}
+      {normalizedScores.length > 0 && <div className="confidenceSummary">
+        <span>{normalizedScores.length} scored findings</span>
+        <span>Average: {pct(averageScore)}</span>
+        {distribution.map(item => <span key={item.level}>{item.level}: {item.count} ({item.percent}%)</span>)}
+      </div>}
     </section>
   );
 }
@@ -463,79 +732,157 @@ function ReportTab({ report, meta, activeKey }) {
   );
 }
 
+class AppErrorBoundary extends React.Component {
+  state = { error: null };
+
+  static getDerivedStateFromError(error) {
+    return { error };
+  }
+
+  render() {
+    if (this.state.error) {
+      return (
+        <main className="report">
+          <section className="panel errorPanel">
+            <h1>Unable to display this report</h1>
+            <p>{this.state.error.message || 'The imported file contains an unsupported value.'}</p>
+            <button className="secondary" onClick={() => window.location.reload()}><RotateCcw size={17} /> Reload application</button>
+          </section>
+        </main>
+      );
+    }
+    return this.props.children;
+  }
+}
+
 function App() {
-  const [active, setActive] = useState('duplicate_billing');
-  const [rawData, setRawData] = useState(seedReport);
-  const [loadedName, setLoadedName] = useState('demo seed data');
-  const [folderSummary, setFolderSummary] = useState(null);
+  const [active, setActive] = useState(() => {
+    const saved = getStoredLastFolderRun();
+    return saved?.data ? reportKeyForInput(saved.data) : 'duplicate_billing';
+  });
+  const [rawData, setRawData] = useState(() => getStoredLastFolderRun()?.data || seedReport);
+  const [loadedName, setLoadedName] = useState(() => getStoredLastFolderRun()?.loadedName || 'demo seed data');
+  const [folderSummary, setFolderSummary] = useState(() => getStoredLastFolderRun()?.summary || null);
+  const [lastFolderRun, setLastFolderRun] = useState(getStoredLastFolderRun);
+  const [isLoading, setIsLoading] = useState(false);
   const normalized = useMemo(() => normalizeInput(rawData), [rawData]);
-  const report = normalized.reports[active] || normalized.reports.duplicate_billing;
+  const report = normalized.reports[active] || emptyReport(active === 'upcoding' ? 'Upcoding' : 'Duplicate Billing', 'No report data is available.');
 
   const onLoad = async event => {
     const file = event.target.files?.[0];
     if (!file) return;
+    event.target.value = '';
+    setIsLoading(true);
+    setFolderSummary(null);
     try {
-      const parsed = JSON.parse(await file.text());
-      setRawData(parsed);
+      const parsed = await parseInputFile(file, active);
+      const parsedReportKey = reportKeyForInput(parsed);
+      setRawData(current => clearReportCategory(current, parsedReportKey));
+      setRawData(current => mergeImportedCategory(current, parsed));
+      setActive(parsedReportKey);
       setLoadedName(file.name);
       setFolderSummary(null);
     } catch (error) {
-      alert(`Could not parse JSON: ${error.message}`);
+      alert(`Could not parse input file: ${error.message}`);
+    } finally {
+      setIsLoading(false);
     }
   };
 
   const onReset = () => {
     setRawData(seedReport);
+    setActive('duplicate_billing');
     setLoadedName('demo seed data');
     setFolderSummary(null);
   };
 
   const onLoadFolder = async event => {
-    const files = Array.from(event.target.files || []).filter(file => file.name.toLowerCase().endsWith('.json'));
+    const supportedExtensions = ['.json', '.xls', '.xlsm', '.xlsx'];
+    const files = Array.from(event.target.files || []).filter(file => supportedExtensions.some(extension => file.name.toLowerCase().endsWith(extension)));
+    event.target.value = '';
     if (!files.length) {
-      alert('No JSON files were found in the selected folder.');
+      alert('No JSON or Excel files were found in the selected folder.');
       return;
     }
 
+    setIsLoading(true);
+    setRawData(current => clearReportCategory(current, active));
+    setFolderSummary(null);
     const parsed = [];
     const failures = [];
     for (const file of files) {
       try {
-        parsed.push(JSON.parse(await file.text()));
+        parsed.push(await parseInputFile(file));
       } catch (error) {
         failures.push(`${file.name}: ${error.message}`);
       }
     }
 
     if (!parsed.length) {
-      alert(`Could not parse any JSON files from the selected folder.\n\n${failures.join('\n')}`);
+      setIsLoading(false);
+      alert(`Could not parse any JSON or Excel files from the selected folder.\n\n${failures.join('\n')}`);
       return;
     }
 
     const folderName = files[0].webkitRelativePath?.split('/')[0] || 'selected folder';
     const consolidated = buildConsolidatedPayload(parsed, folderName);
     setRawData(consolidated);
-    setLoadedName(`Folder: ${folderName} (${parsed.length} JSON file${parsed.length === 1 ? '' : 's'})`);
+    setActive(reportKeyForInput(consolidated));
+    setLoadedName(`Folder: ${folderName} (${parsed.length} input file${parsed.length === 1 ? '' : 's'})`);
     setFolderSummary({
       folderName,
       totalFiles: files.length,
       loadedCount: parsed.length,
       failedCount: failures.length
     });
+    setLastFolderRun({
+      data: consolidated,
+      loadedName: `Folder: ${folderName} (${parsed.length} input file${parsed.length === 1 ? '' : 's'})`,
+      summary: {
+        folderName,
+        totalFiles: files.length,
+        loadedCount: parsed.length,
+        failedCount: failures.length
+      }
+    });
+    try {
+      localStorage.setItem(lastFolderStorageKey, JSON.stringify({
+        data: consolidated,
+        loadedName: `Folder: ${folderName} (${parsed.length} input file${parsed.length === 1 ? '' : 's'})`,
+        summary: {
+          folderName,
+          totalFiles: files.length,
+          loadedCount: parsed.length,
+          failedCount: failures.length
+        }
+      }));
+    } catch {
+      // Keep the current-session restore available if browser storage is full or disabled.
+    }
+    setIsLoading(false);
 
     if (failures.length) {
-      alert(`Loaded ${parsed.length} JSON file${parsed.length === 1 ? '' : 's'} with ${failures.length} parse failure${failures.length === 1 ? '' : 's'}.\n\n${failures.join('\n')}`);
+      alert(`Loaded ${parsed.length} input file${parsed.length === 1 ? '' : 's'} with ${failures.length} parse failure${failures.length === 1 ? '' : 's'}.\n\n${failures.join('\n')}`);
     }
+  };
+
+  const onUseLastFolder = () => {
+    if (!lastFolderRun) return;
+    setRawData(lastFolderRun.data);
+    setActive(reportKeyForInput(lastFolderRun.data));
+    setLoadedName(lastFolderRun.loadedName);
+    setFolderSummary(lastFolderRun.summary);
   };
 
   return (
     <div className="app">
-      <TopBar onLoad={onLoad} onLoadFolder={onLoadFolder} onReset={onReset} loadedName={loadedName} />
+      <TopBar onLoad={onLoad} onLoadFolder={onLoadFolder} onUseLastFolder={onUseLastFolder} onReset={onReset} loadedName={loadedName} hasLastFolder={Boolean(lastFolderRun)} />
       <nav className="tabs">
         <TabButton id="duplicate_billing" active={active === 'duplicate_billing'} onClick={setActive}>Duplicate Billing</TabButton>
         <TabButton id="upcoding" active={active === 'upcoding'} onClick={setActive}>Upcoding</TabButton>
       </nav>
       <FolderSummaryBadge summary={folderSummary} />
+      {isLoading && <main className="report"><section className="panel loading"><LoaderCircle className="loadingSpinner" size={28} aria-label="Loading" /><div><h2>Loading report...</h2><p>The selected category is being replaced; the other category is unchanged.</p></div></section></main>}
       <ReportTab report={report} meta={{ ...normalized.meta }} activeKey={active} />
       <div className="status"><CheckCircle2 size={16}/> GitHub Actions deployment ready</div>
     </div>
@@ -544,6 +891,6 @@ function App() {
 
 createRoot(document.getElementById('root')).render(
   <React.StrictMode>
-    <App />
+    <AppErrorBoundary><App /></AppErrorBoundary>
   </React.StrictMode>
 );
